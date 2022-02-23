@@ -8,7 +8,7 @@
 
 不同于 Vue 2.x，Vue 3.x 放弃了 `Object.defineProperty()` 的方式，选择了 `ES6 Proxy` 来实现响应式系统，并且将响应式系统更多的暴露给用户。但是其中的设计思路并没有变化：对数据劫持，将其变为响应式数据，更具体一些就是，在 getter 中收集依赖，在 setter 中触发 trigger 来重新执行函数。
 
-### 副作用函数与响应式数据
+### 副作用函数
 
 副作用函数，这是个与纯函数相对的概念。副作用函数执行会产生副作用（废话）。举个例子，Vue 模板中读取了一个数据（响应式数据），这里副作用函数就是 render 函数，render 函数读取响应式数据，并将 UI 渲染到页面上（其实只是生成了虚拟节点）。那么，当 render 函数读取过的数据变化时，render 函数应该重新执行，生成新的虚拟节点。我们抽取一下其中的思想：**如果一个副作用函数读取了响应式数据，那么响应式数据变化时，这个函数应该重新执行**。为什么一定是副作用函数呢？因为不产生我们需要的副作用的函数我们不 care 啊。简单的总结就是：**副作用函数，就是我们需要他跟着响应式数据变化的函数**。
 
@@ -146,6 +146,8 @@ function trigger(target, key) {
 }
 ```
 
+#### cleanUp
+
 现在我们只是大致实现了基本原理，但还是有很多细节没有考虑，比如当用户的副作用函数读取数据时，是通过分支语句读取的，那么当分支语句切换时，会产生遗留的副作用函数：
 
 ```js
@@ -224,7 +226,7 @@ function cleanUp(effectFn) {
 }
 ```
 
-目前我们的逻辑通畅，但是执行会产生死循环，因为我们的 trigger 会遍历 set，执行所有函数，但执行函数会调用 cleanUp，将函数本身从 set 移除，随后又执行 fn，导致函数又被添加到 set 中，这就相当于：
+目前我们的逻辑通畅，但是执行会产生死循环，因为我们的 `trigger` 会遍历 `set`，执行所有函数，但执行函数会调用 `cleanUp`，将函数本身从 `set` 移除，随后又执行 `fn`，导致函数又被添加到 `set` 中，这就相当于：
 
 ```js
 const set = new Set([1]);
@@ -232,10 +234,10 @@ const set = new Set([1]);
 set.forEach(item => {
   set.delete(1);
   set.add(1);
-})
+});
 ```
 
-这会导致无限循环。解决方法就是，我们遍历一个 set 副本，而不是直接修改正在遍历的 set：
+这会导致无限循环。解决方法就是，我们遍历一个 `set` 副本，而不是直接修改正在遍历的 `set`：
 
 ```js
 function trigger(target, key) {
@@ -249,3 +251,193 @@ function trigger(target, key) {
 ```
 
 现在我们就完成了对遗留的副作用函数的清理。
+
+
+
+### 响应式数据
+
+#### 引用类型
+
+之前我们都是硬编码的方式，对数据进行代理拦截，接下来我们要优化响应式数据的封装：
+
+```js
+function reactive(obj) {
+  return new Proxy(obj, {
+    // 各种拦截器
+  });
+}
+```
+
+值得注意的是，`reactive` 是深层响应的，因为其中的 `get` 拦截器如果发现返回的属性是一个对象，会递归的调用 `reactive` 返回响应的对象。
+
+但是有时我们可能不希望深响应，这就催生了 `shallowReactive` ，即浅响应。浅响应不会递归的返回响应对象，而是只有一层响应。
+
+同样，Vue 3.0 在完成各种代理时也完成了只读属性和浅只读属性，只需要在拦截器中拦截掉所有修改即可。
+
+#### 原始类型
+
+对于非原始值（即 JS 引用类型）的拦截，Proxy 是做不到的，因为他们并不按照引用的方式传递，当原始值赋值时，两个变量时完全没有关系的。所以 Vue 3.0 对于原始值的响应式处理是：**包裹一层对象，让它变成引用类型**。
+
+```js
+function ref(val) {
+  return reactive({
+    value: val
+  });
+}
+```
+
+所以从实现来看，`ref(1)` 与 `reactive({ value: 1 })` 并没有区别。但是我们需要知道它是一个 ref 包裹的原始值，还是真的就是一个响应的对象，因为这涉及到 Vue 自动脱 ref（Vue 为了避免用户反复通过 `.value` 语法来编码，会自动取 ref 对象的 `value` 属性）。所以 Vue 给 ref 对象添加了一个不可枚举的属性来标记：
+
+```js
+function ref(val) {
+  const wrapper = {
+    value: val
+  };
+  // 添加一个不可枚举的属性标记
+  Object.defineProperty(wrapper, '__v_isRef', {
+    value: true
+  });
+  return reactive(wrapper);
+}
+```
+
+#### toRef 和 toRefs
+
+我们可能会希望在 `setup` 返回的对象中直接展开一个包裹好的响应式对象，这样代码会看起来很简洁，而且不需要反复的用 `.` 来取属性。但是实际上，如果我们直接用展开运算符来展开一个响应式对象，那会导致丢失响应。
+
+```js
+const obj = reactive({
+  foo: 1,
+  bar: 2
+});
+
+return {
+  ...obj
+};
+// 这么做等价于
+return {
+  foo: 1,
+  bar: 2
+};
+```
+
+所以需求是：我们能不能得到一个普通对象，其中的每一个属性都映射到了响应式的对象对应的属性上，这样我们就可以对这个普通对象展开，所有的属性依旧指向响应式对象的属性？
+
+答案是可以的，我们需要使用 `getter` 和 `setter` 来让普通对象的属性和响应式对象的属性之间建立联系：
+
+```js
+const obj = reactive({ foo: 1, bar: 2 });
+
+const newObj = {
+  foo: {
+    get value() {
+      return obj.foo;
+    },
+    set value(newVal) {
+      obj.foo = newVal;
+    }
+  },
+  bar: {
+    get value() {
+			return obj.bar;
+    },
+    set value(newVal) {
+      obj.bar = newVal;
+    }
+  }
+}
+```
+
+观察上面的 `newObj`，我们其实是建立了一个新的普通对象，这个对象的每一个属性都类似于一个 `ref` 包裹的对象，引用着原始的响应对象。为了概念上的统一，我们将这些属性也视作 `ref` 对象。接下来将这个逻辑改为函数：
+
+```js
+function toRef(obj, key) {
+  const wrapper = {
+    get value() {
+      return obj[key];
+    },
+    set value(newVal) {
+      obj[key] = newVal;
+    }
+  }
+  // 视作真正的 ref 对象
+  Object.defineProperty(wrapper, '__v_isRef', {
+    value: true
+  })
+  
+  return wrapper;
+}
+
+const obj = reactive({ foo: 1, bar: 2 });
+// 我们希望得到的，为展开运算符消费的普通对象
+const newObj = {
+  // 其中的属性保持了对响应式对象的链接，可以看做是真正的 ref 对象
+  foo: toRef(obj, 'foo'),
+  bar: toRef(obj, 'bar')
+};
+```
+
+那么我们可以再封装一次，让我们不需要自己一次次调用 `toRef` 函数：
+
+```js
+function toRefs(obj) {
+  const res = {};
+  for (const key in obj) {
+    // 调用toRef来批量转换
+    res[key] = toRef(obj, key);
+  }
+  return res;
+}
+```
+
+这样，当我们读取 `toRef` 产生的对象时，其实是读取了对应响应式数据，设置其值时，也是对响应式数据进行设置。
+
+#### 自动脱 ref
+
+为了不给用户增加更多的心智负担，我们希望在模板中能自动脱去 ref 的能力，即会自动读取 `ref` 对象的 `value` 属性。
+
+```vue
+<template>
+	<!-- 我们希望这么使用，而不是foo.value -->
+	<h2>{{foo}}</h2>
+</template>
+
+<script>
+	export default {
+    setup() {
+      const obj = reactive({
+        foo: 1,
+        bar: 2
+      });
+      
+      return {
+        ...toRefs(obj)
+      }
+    }
+  }
+</script>
+```
+
+Vue 给出的解决方案是：再通过 Proxy 代理一次。
+
+```js
+function proxyRefs(target) {
+  return new Proxy(target, {
+    get(target, key, receiver) {
+      const value = Reflect.get(target, key, receiver);
+      // 如果是 ref 对象，就读取 value 属性
+      return value.__v_isRef ? value.value : value;
+    },
+    set(target, key, newValue, receiver) {
+      const value = target[key];
+      if (value.__v_isRef) {
+        value.value = newValue;
+        return;
+      }
+      return Reflect.set(target, key, newValue, receiver);
+    }
+  })
+}
+```
+
+`setup` 函数返回的对象，会被这个函数处理一次，这就是为什么我们可以直接在模板中使用 `ref` 值，而无需通过 `value` 属性。
