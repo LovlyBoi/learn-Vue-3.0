@@ -441,3 +441,164 @@ function proxyRefs(target) {
 ```
 
 `setup` 函数返回的对象，会被这个函数处理一次，这就是为什么我们可以直接在模板中使用 `ref` 值，而无需通过 `value` 属性。
+
+## 第三章 渲染器
+
+### 整体概述
+
+渲染器是框架性能的核心。渲染器负责将虚拟 DOM 渲染到特定平台上（是跨平台的）。
+
+```js
+function createRenderer() {
+  function render(vnode, container) {
+    // ...
+  }
+  
+  function hydrate(vnode, container) {
+    // ...
+  }
+  
+  return {
+    render,
+    hydrate
+  }
+}
+
+const renderer = createRenderer();
+// 首次渲染
+renderer.render(oldVnode, document.querySelector('#app'));
+// 第二次渲染
+renderer.render(newVnode, document.querySelector('#app'));
+// 第三次渲染
+renderer.render(null, document.querySelector('#app'));
+```
+
+这里我们的 `createRenderer` 函数创建了一个渲染器，渲染器（renderer）和渲染（render）是有区别的，渲染器中包含了更多的功能（比如 hydrate 函数），而 `render` 只负责将虚拟 DOM 渲染到容器中。
+
+我们首次渲染时，是没有 oldVnode 的，只有我们传入的新的 Vnode，这时我们需要执行「挂载」操作，将传入的 Vnode 挂载进容器中。
+
+当我们第二次调用 render 函数时，这时，容器中会保存下来上一次的 Vnode，与本次传入的新的 Vnode 进行对比，力求最小量对 DOM 进行更新，所以这时我们需要执行「更新」操作。
+
+当我们第三次调用 render 函数，传入的新的 Vnode 是 null，表示我们本次要执行的是一个「卸载」操作，需要对容器中的 DOM 进行卸载。
+
+当然，我们其实是可以将「挂载」和「更新」这两个操作看做是一个操作，「挂载」是特殊的「更新」。
+
+```js
+function render(vnode, container) {
+  // 传入了vnode，表示要进行更新操作
+  if(vnode) {
+    patch(contain._vnode, vnode, container);
+  }
+  // 没传入vnode，表示需要卸载
+  else {
+    // 卸载逻辑
+  }
+  // 这次的vnode保存下来，下次再调用时使用
+  container._vnode = vnode
+}
+```
+
+### 挂载与更新
+
+那么我们开始考虑 `patch` 函数：
+
+```js
+function patch(oldVnode, newVnode, container) {
+  // 没有oldVnode，说明要挂载
+  if(!oldVnode) {
+    mountElement(newVnode, container);
+  }
+  // 要更新
+  else {
+    // 更新逻辑
+  }
+}
+```
+
+这里我们将所有对平台具体的操作抽离出去，这样我们可以针对不同的平台修改这些函数。
+
+#### 挂载
+
+我们可以考虑 `mountElement` 函数：
+
+```js
+function createRenderer(options) {
+  // 将跨平台实现的函数传进来
+  const {
+    createElement,
+    insert,
+    setElementText
+  } = options;
+  
+  function mountElement(vnode, container) {
+    // 将真实的DOM元素保存下来，这样方便其他的操作
+    const el = vnode.el = createElement(vnode.type);
+    
+    // 处理children
+    // children属性为字符串，设置内部文本
+    if(typeof vnode.children === 'string') {
+      setElementText(el, vnode.children);
+    }
+    // 有子节点
+    else if(Array.isArray(vnode.children)) {
+      // 遍历子节点，对每一个子节点进行挂载，所以第一个参数是null
+      vnode.children.forEach(child => patch(null, child, el));
+    }
+    
+    // 处理props
+    for(const key in vnode.props) {
+      // 设置属性，这里我们可以选择直接设置，也可以通过setAttribute，这要看具体的情况（不多展开细节）
+      el[key] = vnode.props[key];
+    }
+    
+    // 将定制好的节点插入容器
+    insert(el, container);
+  }
+  
+  function patch(oldVnode, newVnode, container) {
+    // ...
+  }
+  
+  function render(vnode, container) {
+    // ...
+  }
+  
+  return {
+    render
+  }
+}
+```
+
+#### 卸载
+
+接着我们讨论「卸载」操作：
+
+```js
+function render(vnode, container) {
+  if(vnode) {
+    patch(contain._vnode, vnode, container);
+  }
+  // 没传入vnode，表示需要卸载
+  else {
+  	if(container._vnode) {
+      // 封装进unmount函数
+      unmount(container._vnode)
+    }
+  }
+  container._vnode = vnode
+}
+```
+
+```js
+function unmount(vnode) {
+  // 我们调用原生的卸载方法
+  const parent = vnode.el.parentNode;
+  if(parent) parent.removeChild(vnode.el);
+}
+```
+
+由于我们想要卸载的元素，可能是组件，或者包含自定义指令，这时我们需要在执行 `unmount` 函数时，调用这些钩子函数。
+
+#### 事件的处理
+
+关于事件，我们需要考虑：如何在虚拟节点上描述事件、如何将事件添加在 DOM 上 以及 如何更新事件。
