@@ -602,3 +602,161 @@ function unmount(vnode) {
 #### 事件的处理
 
 关于事件，我们需要考虑：如何在虚拟节点上描述事件、如何将事件添加在 DOM 上 以及 如何更新事件。
+
+对于描述事件，我们可以把事件看做是特殊的，以 `on` 开头的属性。
+
+将事件添加在 DOM 上，我们只需要通过 `addEventListener` 来绑定即可。
+
+但是对于事件更新，如果我们需要更换事件，则需要 `removeEventListener`，再绑定新的事件。所以 Vue 采用了比较取巧的方式：绑定一个假的事件处理函数，在这个函数中调用真实的处理函数，这样我们就可以直接换掉真实的函数了。
+
+```js
+function patchProps(el, key, prevValue, nextValue) {
+  if(/^on/.test(key)) {
+    // 这个invoker就是我们的假的处理函数，保存在el._vei中
+    const invokers = el._vei || (el._vei = {});
+    let invoker = invokers[key];
+    const name = key.slice(2).toLowerCase();
+    if(nextValue) {
+      // 之前没有绑定过这个事件
+      if(!invoker) {
+        invoker = el._vei[key] = (e) => {
+          // 调用真正的处理函数
+          invoker.value(e)
+        }
+        invoker.value = nextValue;
+        el.addEventListener(name, invoker);
+      } else {
+        // 之前绑定过，直接换值就行
+        invoker.value = newxtValue;
+      }
+    } else if (invoker) {
+      // nextValue 没有值，但是invoker有值，说明需要移除事件
+      el.removeEventListener(name, invoker)
+    }
+  }
+  else if (key === 'class') {
+    // ...
+  }
+  else {
+    // ...
+  }
+}
+```
+
+#### 更新子节点
+
+更新子节点时，我们首先区分子节点是不是只有文本：
+
+- 如果 `vnode.children` 是字符串，那么说明元素有文本子节点。
+- 如果 `vnode.children` 是数组，那么说明元素有多个子节点。
+
+之所以要区分文本节点和子节点，是因为这样我们可以让更新子节点的逻辑更清晰。
+
+那么一个节点的子节点有可能是：
+
+- 没有子节点
+- 文本子节点
+- 一组子节点
+
+由于有新旧节点之分，那么就是 3 * 3 = 9 种情况。
+
+```js
+function patchElement(n1, n2) {
+  const el = n2.el = n1.el;
+  const oldProps = n1.props;
+  const newProps = n2.props;
+  // 更新props
+  for (const key in newProps) {
+    // 更新属性
+    if (newProps[key] !== oldProps[key]) {
+      patchProps(el, key, oldProps[key], newProps[key]);
+    }
+  }
+  for (const key in oldProps) {
+    // 删除属性
+    if (!(key in newProps)) {
+      patchProps(el, key, oldProps[key], null);
+    }
+  }
+  // 更新子节点
+  patchChildren(n1, n2, el);
+}
+```
+
+```js
+function patchChild(n1, n2, container) {
+  // 新子节点是字符串
+	if (typeof n2.children === 'string') {
+    // 如果旧子节点是一组子节点，依次卸载
+    if (Array.isArray(n1.children)) {
+      n1.children.forEach(c => unmount(c));
+    }
+    // 旧子节点是其他两种情况，直接换成新的文本即可
+    setElementText(container, n2.children);
+  }
+  // 新子节点是一组子节点
+  else if (Array.isArray(n2.children)) {
+    // 旧子节点也是一组子节点
+    if (Array.isArray(n1)) {
+      // 这里就是核心的 diff 算法
+      
+    } else {
+      // 旧子节点不是一组子节点，我们只需要清空之前的内容，依次挂载新的子节点
+      setElementText(container, '');
+      n1.children.forEach(c => patch(null, c, container));
+    }
+  }
+  // 新子节点不存在
+  else {
+    if (Array.isArray(n1.children)) {
+      n1.children.forEach(c => unmount(c));
+    }
+    else if (typeof n1.children === 'string') {
+      setElementText(container, '');
+    }
+  }
+}
+```
+
+### Diff 算法
+
+接下来我们就来看看渲染器中最核心的 diff 算法。
+
+当新旧子节点都是一组子节点时，为了最小的性能开销完成更新，需要通过 diff 比较出两组节点的区别，然后最小量更新 DOM。
+
+#### 简单 Diff 算法
+
+我们可以对两组节点依次对比（不考虑节点仅顺序改变），如果有标签可以复用，我们就可以少操作一次 DOM。
+
+```js
+function patchChildren(n1, n2, container) {
+  // ...
+  else if (Array.isArray(n2)) {
+    if (Array.isArray(n1)) {
+      const oldChildren = n1.children;
+      const newChildren = n2.children;
+      const oldLen = oldChildren.length;
+      const newLen = newChildren.length;
+      // 找到较短的长度，作为公共长度
+      const commonLen = Math.min(oldLen, newLen);
+      for (let i = 0; i < commonLen; i++) {
+        patch(oldChildren[i], newChildren[i]);
+      }
+      if (newLen > oldLen) {
+        // 如果新节点更长，那么把新的节点挂载上去
+        for (let i = commonLen; i < newLen; i++) {
+          patch(null, newChildren[i], container);
+        }
+      } else if (oldLen > newLen) {
+        for (let i = commonLen; i < oldLen; i++) {
+          // 如果旧节点更长，就把长的部分卸载掉
+          unmount(oldChildren[i]);
+        }
+      }
+    }
+  }
+  // ...
+}
+```
+
+那么我们可以很轻易地发现这种方法还有很大的优化空间，首先就是我们并没有考虑到顺序改变后 DOM 的复用。
