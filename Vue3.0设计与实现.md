@@ -396,7 +396,7 @@ function toRefs(obj) {
 
 为了不给用户增加更多的心智负担，我们希望在模板中能自动脱去 ref 的能力，即会自动读取 `ref` 对象的 `value` 属性。
 
-```vue
+```html
 <template>
 	<!-- 我们希望这么使用，而不是foo.value -->
 	<h2>{{foo}}</h2>
@@ -487,7 +487,7 @@ renderer.render(null, document.querySelector('#app'));
 function render(vnode, container) {
   // 传入了vnode，表示要进行更新操作
   if(vnode) {
-    patch(contain._vnode, vnode, container);
+    patch(container._vnode, vnode, container);
   }
   // 没传入vnode，表示需要卸载
   else {
@@ -760,3 +760,49 @@ function patchChildren(n1, n2, container) {
 ```
 
 那么我们可以很轻易地发现这种方法还有很大的优化空间，首先就是我们并没有考虑到顺序改变后 DOM 的复用。
+
+有些时候，我们很可能只是改变了几个 DOM 节点的排列顺序，这时我们只需要移动这些 DOM 节点就可以了。这时我们需要能鉴别出，哪些 DOM 节点是相同的，这只靠 vnode.type 并不可靠：
+
+```js
+// oldChildren
+{
+  { type: 'p', clildren: '1' },
+  { type: 'p', clildren: '2' },
+  { type: 'p', clildren: '3' },
+}
+// newChildren
+{
+  { type: 'p', clildren: '2' },
+  { type: 'p', clildren: '3' },
+  { type: 'p', clildren: '1' },
+}
+```
+
+这种情况我们只需要移动节点顺序，但是我们无法判断哪些节点是相同的节点，这就是我们为什么需要 key 属性。我们可以通过 key 的值来对节点进行鉴别。
+
+要注意的是，即使是 key 值相同，也不意味着不需要进行 patch，因为新旧节点的值可能会改变，只是说这个 DOM 可以复用。
+
+```js
+function patchChildren(n1, n2, container) {
+	if (typeof n2.children === 'string') {
+		// ...
+  } else if (Array.isArray(n2.children)) {
+    const oldChildren = n1.children;
+    const newChildren = n2.children;
+    
+    // 依次比对，寻找相同节点
+    for (const oldVNode of oldChildren) {
+      for (const newVNode of newChildren) {
+        if (oldVNode !== newVNode) {
+          // 找到相同节点，进行patch
+					patch(oldVNode, newVNode, container);
+          break;
+        }
+      }
+    };
+  } else {
+		// ...
+  }
+};
+```
+
