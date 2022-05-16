@@ -678,7 +678,7 @@ function patchElement(n1, n2) {
       patchProps(el, key, oldProps[key], null);
     }
   }
-  // 更新子节点
+  // 更新子节点的函数
   patchChildren(n1, n2, el);
 }
 ```
@@ -782,6 +782,8 @@ function patchChildren(n1, n2, container) {
 
 要注意的是，即使是 key 值相同，也不意味着不需要进行 patch，因为新旧节点的值可能会改变，只是说这个 DOM 可以复用。
 
+##### 更新节点
+
 ```js
 function patchChildren(n1, n2, container) {
 	if (typeof n2.children === 'string') {
@@ -790,18 +792,173 @@ function patchChildren(n1, n2, container) {
     const oldChildren = n1.children;
     const newChildren = n2.children;
     
-    // 依次比对，寻找相同节点
-    for (const oldVNode of oldChildren) {
-      for (const newVNode of newChildren) {
+    // 遍历新节点，寻找相同节点（先遍历新节点是为了避免有节点被移除）
+    for (const newVNode of newChildren) {
+      for (const oldVNode of oldChildren) {
         if (oldVNode !== newVNode) {
           // 找到相同节点，进行patch
 					patch(oldVNode, newVNode, container);
-          break;
+          break; // 找到了，不需要再找了
         }
       }
     };
   } else {
 		// ...
+  }
+};
+```
+
+这样我们就可以保证，所有的新旧节点都已经更新了，但是还没有移动到正确的顺序。因为我们是使用新节点依次对比旧节点，所以我们已经解决了挂载和卸载的问题。
+
+##### 移动元素
+
+我们可以开始考虑移动元素。首先我们需要找到要移动的元素。我们可以先思考什么时候不需要移动元素？答案是在节点顺序没有发生变化时，我们不需要移动元素。
+
+```js
+// oldChildren
+{
+  { key: 1 },
+  { key: 2 },
+  { key: 3 },
+}
+
+// newChildren1 和之前一样，不需要移动
+{
+  { key: 1 },
+  { key: 2 },
+  { key: 3 },
+}
+
+// newChildren2 少了一个，但是顺序没变，也不需要移动
+{
+  { key: 1 },
+  { key: 3 },
+}
+
+// newChildren3 打乱顺序，需要移动
+{
+  { key: 3 },
+  { key: 1 },
+  { key: 2 },
+}
+```
+
+那么我们就可以发现，重点在于 **「相对顺序」**，而不是简单的比较。
+
+我们使用新节点（`newChildren1`）依次对比旧节点，可以发现新的元素在旧节点中的位置为：0, 1, 2。是一个递增序列，说明 **「相对顺序」** 没有改变，所以不需要移动。
+
+我们还可以以同样的方法来看 `newChildren2`，序列为：0, 2。所以也不需要移动。
+
+那么我们来看需要移动的 `newChildren3`：
+
+- 第一个新节点对应旧节点中的位置是 2；
+
+- 第二个新节点是 0，说明他与前一个节点的顺序不对，这个节点需要被移动；
+
+- 第三个节点是 1，说明与第一个节点的顺序不对，也需要被移动；
+
+我们再简单的总结一下这个算法：找到一个**「相对位置」**最大的索引值（也可以是暂时最大的，因为即使后面有更大的也不影响，说明前面的都比那个更大的小），后面如果有更大的，就更新这个最大索引值，如果更小，则说明这个节点需要移动。
+
+```js
+function patchChildren(n1, n2, container) {
+	// ...
+  else if (Array.isArray(n2)) {
+    const oldChildren = n1.children;
+    const newChildren = n2.children;
+    
+    // 最大索引
+    let lastIndex = 0;
+    for (let i = 0; i < newChilren.length; i++) {
+      const newVNode = newChildren[i];
+      for (let j = 0; j < oldChlidren.length; j++) {
+        const oldVNode = oldChildren[j];
+        if (newVNode.key === oldVNode.key) {
+					patch(oldVNode, newVNode, container);
+          if (j < lastIndex) {
+            // 当前找到的索引值小于最大索引值，需要移动
+          } else {
+            // 找到的索引值不小于最大索引值，需要更新
+            lastIndex = j
+          }
+          break;
+        }
+      };
+    }
+  } else {
+    // ...
+  }
+};
+```
+
+在我们找到要移动的元素后，我们就可以思考怎么移动元素了。想要移动元素，我们需要拿到元素的引用，这在 patch 时，被放进了新节点的 el 属性上。
+
+```js
+function patchElement(n1, n2) {
+	const el = n2.el = n1.el;
+  // ...
+};
+```
+
+随后我们考虑如何移动节点，依旧是 `newChildren3`：
+
+```js
+// oldChildren
+{
+  { key: 1 },
+  { key: 2 },
+  { key: 3 },
+
+// newChildren3 打乱顺序，需要移动
+{
+  { key: 3 },
+  { key: 1 },
+  { key: 2 },
+}
+```
+
+1. 取新节点中第一个 key 为 3 的虚拟节点，去找到在旧节点中的索引为 2，更新 `lastIndex` 为 2。
+2. 取下一个节点 key 为 1，找到所在索引为 0，需要移动。将它移动到 `key = 3` 节点的后面。
+3. 再取下一个节点 key 为 2，找到所在索引为 1，需要移动。将它移动到 `key = 1` 节点的后面。
+
+更新完成。我们可以发现，**新节点们的顺序，就是我们希望移动的顺序**。所以对于每个需要移动的节点来说，只需要**把它放在他在新节点中的前一个节点的后面**就行了（因为新节点顺序没错，所以在前一个节点的后一个节点，看似是废话）。
+
+那么我们看下根据这个思路实现的代码：
+
+```js
+function patchChildren(n1, n2, container) {
+  // ...
+  else if (Array.isArray(n2)) {
+    const oldChildren = n1.children;
+    const newChildren = n2.children;
+    
+    // 最大索引
+    let lastIndex = 0;
+    for (let i = 0; i < newChilren.length; i++) {
+      const newVNode = newChildren[i];
+      for (let j = 0; j < oldChlidren.length; j++) {
+        const oldVNode = oldChildren[j];
+        if (newVNode.key === oldVNode.key) {
+					patch(oldVNode, newVNode, container);
+          if (j < lastIndex) {
+            // 当前找到的索引值小于最大索引值，需要移动
+            // 拿到 newVNode 的前一个节点，他对应 DOM 节点后面就是正确的位置
+            const prevVNode = newVNode[i - 1];
+            // 如果 prevVNode 不存在，说明是第一个，不需要移动
+            if (prevVNode) {
+              // 由于我们需要移动真实 DOM 节点，所以需要找到它的下一个兄弟节点，放在他下一个兄弟的前面
+              const anchor = prevVNode.el.nextSibling;
+              // 移动节点，这个函数跨平台实现，在浏览器是由 insertBefore 实现
+              insert(newVNode.el, container, anchor);
+            }
+          } else {
+            lastIndex = j
+          }
+          break;
+        }
+      };
+    } 
+  } else {
+    // ...
   }
 };
 ```
