@@ -252,8 +252,6 @@ function trigger(target, key) {
 
 现在我们就完成了对遗留的副作用函数的清理。
 
-
-
 ### 响应式数据
 
 #### 引用类型
@@ -845,7 +843,7 @@ function patchChildren(n1, n2, container) {
 
 那么我们就可以发现，重点在于 **「相对顺序」**，而不是简单的比较。
 
-我们使用新节点（`newChildren1`）依次对比旧节点，可以发现新的元素在旧节点中的位置为：0, 1, 2。是一个递增序列，说明 **「相对顺序」** 没有改变，所以不需要移动。
+我们使用新节点（`newChildren1`）依次对比旧节点，可以发现新的元素在旧节点中的位置为：0, 1, 2。是一个**递增序列**，说明 **「相对顺序」** 没有改变，所以不需要移动。
 
 我们还可以以同样的方法来看 `newChildren2`，序列为：0, 2。所以也不需要移动。
 
@@ -951,7 +949,7 @@ function patchChildren(n1, n2, container) {
               insert(newVNode.el, container, anchor);
             }
           } else {
-            lastIndex = j
+            lastIndex = j;
           }
           break;
         }
@@ -962,4 +960,589 @@ function patchChildren(n1, n2, container) {
   }
 };
 ```
+
+##### 新增元素
+
+如果 `newChildren` 中有新添加的节点，在 `oldChildren` 中找不到索引。这时我们需要挂载新的节点，并将它放在合适的位置。
+
+```js
+function patchChildren(n1, n2, container) {
+  // ...
+  else if (Array.isArray(n2)) {
+    const oldChildren = n1.children;
+    const newChildren = n2.children;
+    
+    let lastIndex = 0;
+    for (let i = 0; i < newChilren.length; i++) {
+      const newVNode = newChildren[i];
+      // 设定一个变量指示有没有找到匹配的索引
+      let find = false;
+      for (let j = 0; j < oldChlidren.length; j++) {
+        const oldVNode = oldChildren[j];
+        if (newVNode.key === oldVNode.key) {
+          find = true;
+					patch(oldVNode, newVNode, container);
+          if (j < lastIndex) {
+            // 当前找到的索引值小于最大索引值，需要移动
+            // 拿到 newVNode 的前一个节点，他对应 DOM 节点后面就是正确的位置
+            const prevVNode = newVNode[i - 1];
+            // 如果 prevVNode 不存在，说明是第一个，不需要移动
+            if (prevVNode) {
+              // 由于我们需要移动真实 DOM 节点，所以需要找到它的下一个兄弟节点，放在他下一个兄弟的前面
+              const anchor = prevVNode.el.nextSibling;
+              // 移动节点，这个函数跨平台实现，在浏览器是由 insertBefore 实现
+              insert(newVNode.el, container, anchor);
+            }
+          } else {
+            lastIndex = j;
+          }
+          break;
+        }
+      };
+      // 找完一个新节点，来看看这个节点是不是新节点。find 为 false 表示这个节点需要挂载
+      if (!find) {
+        // 找到前一个节点的下一个兄弟节点作为锚点
+				const prevVNode = newChildren[i - 1];
+        let anchor = null;
+        // 如果有前置节点，说明不是第一个
+        if (prevVNode) {
+          anchor = prevVNode.el.nextSibling;
+        }
+        // 说明是第一个节点，使用第一个元素作为锚点
+        else {
+          anchor = container.firstChild;
+        }
+        // 挂载节点，这里需要指定挂载位置
+        patch(null, newVNode, container, anchor);
+      }
+    } 
+  } else {
+    // ...
+  }
+};
+```
+
+由于我们需要新的 `patch` 函数，所以我们再修改一下
+
+```js
+// patch 函数接受第四个参数，即锚点元素
+function patch() {
+  // ...
+  if (typeof type === 'string') {
+    if (!n1) {
+      // 挂载，将锚点元素传过去
+      mountElement(n2, container, anchor);
+    } else {
+      patchElement(n1, n2);
+    }
+  }
+  // ...
+}
+
+function mountElement(vnode, container, anchor) {
+	// ...
+  insert(el, container, anchor);
+}
+```
+
+##### 移除元素
+
+如果新的节点被删除了，那么旧节点会遗留下来。我们只需要在新节点都移动处理完后，再遍历一遍旧节点，删除其中的不存在的节点即可。
+
+```js
+function patchChildren(n1, n2, container) {
+  // ...
+  else if (Array.isArray(n2)) {
+    const oldChildren = n1.children;
+    const newChildren = n2.children;
+    
+    let lastIndex = 0;
+    for (let i = 0; i < newChilren.length; i++) {
+      // ...
+    } 
+    
+    // 处理完，再处理删除的节点
+    for (let i = 0; i < oldChildren.length; i++) {
+      const oldVNode = oldChildren[i];
+			const has = newChildren.find(vnode => vnode.key === oldVNode);
+      if (!has) {
+        // 如果在newChildren中找不到，那么删除该节点
+        unmount(oldVNode);
+      }
+    }
+  } else {
+    // ...
+  }
+};
+```
+
+#### 双端 Diff 算法
+
+简单 Diff 算法已经解决了问题，但是仍然有一些缺陷，简单 Diff 算法对 DOM 的移动操作并不是最优的。比如：
+
+```
+新节点					旧节点
+p--3          p--1
+p--1          p--2
+p--2          p--3
+```
+
+ 在这种情况下，简单 Diff 算法会让 p--1 节点和 p--2 节点移动到 p--3 节点的后面，但其实我们只需要将 p--3 节点移动到最前就可以了。
+
+##### 原理
+
+双端 Diff 算法同时对新旧两组节点的两个端点同时进行比较，这里会提供四个指针，分别指向四个端点。
+
+![新旧节点及真实 DOM 状态.jpg](https://s2.loli.net/2022/05/17/y3pbe4t8aldI5DJ.png)
+
+每一轮都会进行四次比较（中间的灰色箭头），如果有某次发现节点可以复用（第四次比较，发现 p-4 节点可以复用），那么移动对应的节点（第四次比较将 oldEndIdx 对应的节点，移动到 oldStartIdx 节点之前），随后指针接着移动。
+
+![第一次移动后状态.jpg](https://s2.loli.net/2022/05/17/QPHqYFCLw9mWlBc.png)
+
+代码如下：
+
+```js
+function patchKeyChild(n1, n2, container) {
+  const oldChildren = n1.children;
+  const newChildren = n2.children;
+  // 四个索引值
+  let oldStartIdx = 0;
+  let oldEndIdx = oldChildren.length - 1;
+  let newStartIdx = 0;
+  let newEndIdx = oldChildren.length - 1;
+  // 四个索引值指向的 vnode 节点
+  let oldStartVNode = oldChildren[oldStartIdx];
+  let oldEndVNode = oldChildren[oldEndIdx];
+  let newStartVNode = newChildren[newStartIdx];
+  let newEndVNode = newChildren[newEndIdx];
+  
+  // 循环进行双端比较，直到有一组结束
+  while (oldStartIdx <= oldEndIdx && newStartIdx <= newEndIdx) {
+    if (oldStartVNode.key === newStartVNode.key) {
+      // 第一次比较，新旧节点起始互相比较
+    } else if (oldEndVNode.key === newEndVNode.key) {
+      // 第二次比较，新旧节点末尾互相比较
+    } else if (oldStartVNode.key === newEndVNode.key) {
+      // 第三次比较，新节点末尾与旧节点起始互相比较
+    } else if (oldEndVNode.key === newStartVNode.key) {
+      // 第四次比较，旧节点末尾与新节点起始互相比较
+      
+      // 假设第四次找到了可复用的节点，需要将 oldEnd，移动到 oldStart 前面
+      // 调用 patch 进行打补丁
+      patch(oldEndVNode, newStartVNode, container);
+      // 移动 DOM
+      insert(oldEndVNode.el, container, oldStartVNode.el);
+      // 更新索引
+      oldEndVNode = oldChildren[--oldEndIdx];
+      newStartVNode = newChildren[++newStartIdx];
+    }
+  }
+}
+```
+
+剩余三种情况的操作也和第四种情况类似，只是移动的元素不同。
+
+直到至少有一方的索引汇合，双端比较结束：
+
+![双端比较结束后状态.jpg](https://s2.loli.net/2022/05/28/VFjmRqdLZwCc9fY.png)
+
+##### 非理想情况
+
+在理想情况下，比如：
+
+```
+新节点					旧节点
+p--3          p--1
+p--1          p--2
+p--2          p--3
+```
+
+我们会发现，双端 Diff 只需要移动一次，而简单 Diff 需要移动两次。
+
+但是这是在能找到可复用节点的情况，如果是这种情况：
+
+```
+新节点					旧节点
+p--2          p--1
+p--4          p--2
+p--1          p--3
+p--3					p--4
+```
+
+我们就会发现，第一轮比较中，一个可复用的节点都没有，这时我们就需要另外的处理方式：我们会拿新一组节点的头部节点去旧一组中寻找：
+
+```js
+while (oldStartIdx <= oldEndIdx && newStartIdx <= newEndIdx) {
+  if (oldStartVNode.key === newStartVNode.key) {
+    // 第一次比较，新旧节点起始互相比较
+  } else if (oldEndVNode.key === newEndVNode.key) {
+    // 第二次比较，新旧节点末尾互相比较
+  } else if (oldStartVNode.key === newEndVNode.key) {
+    // 第三次比较，新节点末尾与旧节点起始互相比较
+  } else if (oldEndVNode.key === newStartVNode.key) {
+    // 第四次比较，旧节点末尾与新节点起始互相比较
+  } else {
+    // 四次比较都没有发现有可复用节点
+    // 使用新节点头部去找对应的索引
+    const idxInOld = oldChildren.findIndex(node => node.key === newStartVNode.key);
+  }
+}
+```
+
+我们找到了头部节点 `p--2` 对应的索引 1，这说明，原来索引 1 的节点，现在应该排在头部，我们可以将它移动到头部。
+
+```js
+while (oldStartIdx <= oldEndIdx && newStartIdx <= newEndIdx) {
+  if (oldStartVNode.key === newStartVNode.key) {
+    // ...
+  } else if (oldEndVNode.key === newEndVNode.key) {
+    // ...
+  } else if (oldStartVNode.key === newEndVNode.key) {
+    // ...
+  } else if (oldEndVNode.key === newStartVNode.key) {
+    // ...
+  } else {
+    // 使用新节点头部去找对应的索引
+    const idxInOld = oldChildren.findIndex(node => node.key === newStartVNode.key);
+    if (idxInOld >= 0) {
+      // 要移动的节点
+      const vnodeToMove = oldChildren[idxInOld];
+      // 打补丁
+      patch(vnodeToMove, newStartVNode, container);
+      // 移动到最前面，即旧节点的最前面
+      insert(vnodeToMove, container, oldStartVNode.el);
+      // 因为这个节点我们已经处理过了，真实 DOM 已经移到了正确位置，设置为 undefined
+      oldChildren[idxInOld] = undefined;
+      // 更新 newStart
+      newStartVNode = newChildren[++newStartIdx];
+    }
+  }
+}
+```
+
+接着双端 Diff 继续比较，直到遇见我们之前设置过的 `undefined`，说明这个节点我们处理过了。我们还需要添加两个处理分支来判断一下这种情况：
+
+```js
+while (oldStartIdx <= oldEndIdx && newStartIdx <= newEndIdx) {
+  if (!oldStartIdx) { // 如果头部节点被处理过，跳过
+    oldStartVNode = oldChildren[++oldStartIdx];
+  } else if (!oldEndIdx) { // 如果尾部节点被处理过，跳过
+    oldEndVNode = oldChildren[--oldEndIdx];
+  } else if (oldStartVNode.key === newStartVNode.key) {
+    // ...
+  } else if (oldEndVNode.key === newEndVNode.key) {
+    // ...
+  } else if (oldStartVNode.key === newEndVNode.key) {
+    // ...
+  } else if (oldEndVNode.key === newStartVNode.key) {
+    // ...
+  } else {
+    const idxInOld = oldChildren.findIndex(node => node.key === newStartVNode.key);
+    if (idxInOld >= 0) {
+      const vnodeToMove = oldChildren[idxInOld];
+      patch(vnodeToMove, newStartVNode, container);
+      insert(vnodeToMove, container, oldStartVNode.el);
+      oldChildren[idxInOld] = undefined;
+      newStartVNode = newChildren[++newStartIdx];
+    }
+  }
+}
+```
+
+ 这样，非理想情况下的问题也解决了。
+
+##### 添加新元素
+
+如果新节点中有在旧节点中找不到的，那么就是新节点，需要挂载到正确的位置去。
+
+![新增节点的情况.jpg](https://s2.loli.net/2022/05/28/2EPLOVjYAwdkv5S.png)
+
+在一轮比较后，我们发现没有可复用的节点，所以试图找到 newStart 对应的旧索引，然后我们发现找不到，说明这是一个新增的节点。
+
+```js
+while (oldStartIdx <= oldEndIdx && newStartIdx <= newEndIdx) {
+  if (!oldStartIdx) {
+    oldStartVNode = oldChildren[++oldStartIdx];
+  } else if (!oldEndIdx) {
+    oldEndVNode = oldChildren[--oldEndIdx];
+  } else if (oldStartVNode.key === newStartVNode.key) {
+    // ...
+  } else if (oldEndVNode.key === newEndVNode.key) {
+    // ...
+  } else if (oldStartVNode.key === newEndVNode.key) {
+    // ...
+  } else if (oldEndVNode.key === newStartVNode.key) {
+    // ...
+  } else {
+    const idxInOld = oldChildren.findIndex(node => node.key === newStartVNode.key);
+    if (idxInOld >= 0) {
+      const vnodeToMove = oldChildren[idxInOld];
+      patch(vnodeToMove, newStartVNode, container);
+      insert(vnodeToMove, container, oldStartVNode.el);
+      oldChildren[idxInOld] = undefined;
+    } else { // 说明节点是新增的节点
+      // 挂载到头部
+      patch (null, newStartVNode, container, oldStartVNode.el);
+    }
+    newStartVNode = newChildren[++newStartIdx];
+  }
+}
+```
+
+但是这样做其实还有遗漏，如果我们改变一下新节点顺序，让新节点能找到可复用节点：
+
+![新增节点的情况-遗漏.jpg](https://s2.loli.net/2022/05/28/8kozcHCmXONqLDF.png)
+
+最终比较结果会变成，旧节点已经结束，但是新节点的 `p--4` 被遗漏下来了。所以我们还需要再进行修补：
+
+```js
+while (oldStartIdx <= oldEndIdx && newStartIdx <= newEndIdx) {
+  // 进行比较
+}
+// 在比较结束后，检查一下剩余的节点
+if (oldEndIdx < oldStartIdx && newStartIdx <= newEndIdx) {
+  // 如果旧节点已经结束，但是新节点还有剩余，说明需要挂载新节点
+  for (let i = newStartIdx; i <= newEndIdx; i++) {
+    // 将剩余的新增节点按顺序挂载到头部
+    patch(null, newChildren[i], container, oldStartVNode.el);
+  }
+}
+```
+
+##### 移除不存在的元素
+
+解决了新增节点的问题，我们再看移除节点的问题：
+
+![移除节点.jpg](https://s2.loli.net/2022/05/28/ld3ozsjYVremgwF.png)
+
+当新节点结束时，旧节点还剩下一个 `p--2` 节点：
+
+![移除节点-结束.jpg](https://s2.loli.net/2022/05/28/9h7ciyFOAKEajZp.png)
+
+所以我们还需要新增一段逻辑来移除旧节点:
+
+```js
+while (oldStartIdx <= oldEndIdx && newStartIdx <= newEndIdx) {
+  // 进行比较
+}
+
+if (oldEndIdx < oldStartIdx && newStartIdx <= newEndIdx) {
+  // 添加新节点
+} else if (newEndIdx < newStartIdx && oldStartIdx <= oldEndIdx) {
+  // 移除旧节点
+  for (let i = oldStartIdx; i <= oldEndIdx; i++) {
+    unmount(oldChildren[i]);
+  }
+}
+```
+
+双端 Diff 算法，就已经完整了。
+
+#### 快速 Diff 算法
+
+Vue 2 采用的是双端 Diff 算法，而 Vue 3 则换成了快速 Diff 算法。快速 Diff 算法顾名思义，他比双端 Diff 算法更快。
+
+
+
+## 第四章 组件化
+
+### 组件的实现原理
+
+上一章讲的是渲染器，渲染器负责将虚拟 DOM 渲染为真实 DOM。当我们编写 Vue 时，实际上就是在编写组件化的虚拟 DOM。这些组件构成了整个 Vue 应用。
+
+#### 渲染组件
+
+从用户的角度看，一个组件是一个对象：
+
+```js
+const MyComponent = {
+	name: 'MyComponent',
+  data() {
+		return {
+      foo: 1,
+    }
+  },
+}
+```
+
+但是从渲染器的角度看，一个组件是一个虚拟 DOM 树。
+
+```js
+const vnode = {
+  // 使用 type 存储组件的选项对象，即用户编写的对象
+  type: MyComponent,
+  // ...
+}
+```
+
+但是这时，我们的 `patch` 函数还没有办法接受组件类型，我们需要增加一个分支判断：
+
+```js
+function patch(n1, n2, container, anchor) {
+	if (n1 && n1.type !== n2.type) {
+    unmount(n1);
+    n1 = null;
+  }
+  const { type } = n2;
+  if (typeof type === 'string') {
+		// 作为普通元素处理
+  } else if (type === Text) {
+    // 作为文本节点处理
+  } else if (type === Fragment) {
+		// 作为片段处理
+  } else if (typeof type === 'object') {
+    // 新增，作为组件处理
+    if (!n1) {
+      // 挂载
+      mountComponent(n2, container, anchor);
+    } else {
+      // 更新组件
+      patchComponent(n1, n2, anchor);
+    }
+  }
+}
+```
+
+当渲染器有能力处理组件后，我们要设计组件应该被如何编写。组件需要描述一段页面结构，所以组件必须有一个渲染函数，即 `render` 函数。这个 `render` 函数还应该返回虚拟 DOM，让渲染器可以将虚拟 DOM 渲染为真实 DOM。
+
+```js
+const MyComponent = {
+  name: 'MyComponent',
+  render() {
+    // 返回虚拟节点
+    return {
+      type: 'div',
+      children: '文本内容',
+    }
+  },
+}
+```
+
+这样，我们就可以将组件传递给渲染器，让渲染器完成渲染：
+
+```js
+// 应用这个组件时，用来描述该组件的虚拟节点
+const CompVNode = {
+  type: MyComponent
+}
+
+renderer.render(CompVNode, document.querySelector('#app'))
+```
+
+`renderer.render` 函数会调用 `mountComponent` 来真正的完成渲染：
+
+```js
+function mountComponent(vnode, container, anchor) {
+  // 拿到用户的组件配置项
+  const componentOptions = vnode.type
+  // 拿到其中的渲染函数
+  const { render } = componentOptions
+  // 调用渲染函数得到虚拟 DOM 树
+  const subTree = render()
+  // 渲染
+  patch(null, subTree, container, anchor)
+}
+```
+
+这样，我们就得到了基本的组件化方案。
+
+#### 组件状态与自更新
+
+实际上在 render 中，引用 data 中的数据是很常见的，我们必须让组件能够具备读取自身状态，而且能自动更新。
+
+```js
+const MyComponent = {
+  data() {
+    return {
+      foo: 'hello world'
+    }
+  },
+  render() {
+    return {
+      type: 'div',
+      children: `foo 的值为: ${this.foo}`, // 在渲染函数中使用组件状态
+    }
+  },
+}
+```
+
+这里的渲染函数，试图获取 data 中的数据，我们需要能让他通过 this 访问到：
+
+```js
+function mountComponent(vnode, container, anchor) {
+  const componentOptions = vnode.type
+  const { render, data } = componentOptions
+  // 使用 reactive 函数初始化 data，将它变成响应式数据
+  const state = reactive(data())
+  // 通过 state 调用 render
+  const subTree = render.call(state, state)
+  patch(null, subTree, container, anchor)
+}
+```
+
+我们再来分析组件自更新。我们需要在 state 变化时，重新调用 render 函数和 patch 函数。我们可以将这两个 副作用函数 用 effect 包裹执行。
+
+```js
+function mountComponent(vnode, container, anchor) {
+  const componentOptions = vnode.type
+  const { render, data } = componentOptions
+  const state = reactive(data())
+  // 通过副作用函数执行，将这两个函数添加到依赖中去
+  effect(() => {
+    const subTree = render.call(state, state)
+  	patch(null, subTree, container, anchor)
+  })
+}
+```
+
+为了避免多次修改状态，导致组件不断更新，我们可以将组件更新放进异步队列里，这样可以对多次更新任务去重，避免反复更新组件。
+
+```js
+// 任务缓存队列，用一个 set 来表示，用来去重
+const queue = new Set()
+// 标志正在刷新任务队列
+let isFlushing = false
+const p = Promise.resolve()
+
+// 调度器，让每一次事件循环都只有一次更新
+function queueJob(job) {
+	queue.add(job)
+  // 如果还没有开始刷新队列，刷新它。如果已经开始刷新，则不需要再添加微任务
+  if (!isFlushing) {
+    isFlushing = true
+    p.then(() => {
+      try {
+        queue.forEach(job => job())
+      } finally {
+        // 执行完全部的任务后，可以接受新的任务了
+        isFlushing = false
+        queue.length = 0
+      }
+    })
+  }
+}
+```
+
+然后我们可以在 `effect` 函数中使用调度器
+
+```js
+function mountComponent(vnode, container, anchor) {
+  const componentOptions = vnode.type
+  const { render, data } = componentOptions
+  
+  const state = reactive(data())
+  
+  effect(() => {
+    const subTree = render.call(state, state)
+  	patch(null, subTree, container, anchor)
+  }, {
+    // 指定调度器
+    scheduler: queueJob
+  })
+}
+```
+
+但是，上面这段代码还有缺陷，就是每次 patch 时，传入的都是 null ，每次都是进行挂载，而不是打补丁。为了实现打补丁，我们需要实现组件实例，用它来维护组件的整个生命周期的状态。
+
+#### 组件实例与生命周期
 
