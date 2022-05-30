@@ -1448,7 +1448,7 @@ function mountComponent(vnode, container, anchor) {
 
 #### 组件状态与自更新
 
-实际上在 render 中，引用 data 中的数据是很常见的，我们必须让组件能够具备读取自身状态，而且能自动更新。
+实际上在 `render` 中，引用 `data` 中的数据是很常见的，我们必须让组件能够具备读取自身状态，而且能自动更新。
 
 ```js
 const MyComponent = {
@@ -1480,7 +1480,7 @@ function mountComponent(vnode, container, anchor) {
 }
 ```
 
-我们再来分析组件自更新。我们需要在 state 变化时，重新调用 render 函数和 patch 函数。我们可以将这两个 副作用函数 用 effect 包裹执行。
+我们再来分析组件自更新。我们需要在 `state` 变化时，重新调用 `render` 函数和 `patch` 函数。我们可以将这两个 副作用函数 用 `effect` 包裹执行。
 
 ```js
 function mountComponent(vnode, container, anchor) {
@@ -1546,3 +1546,489 @@ function mountComponent(vnode, container, anchor) {
 
 #### 组件实例与生命周期
 
+组件实例本质上就是一个对象，维护着组价运行过程中的所有信息，例如注册到组件的生命周期函数、组件渲染的子树（subTree）、组件是否已经被挂载、组件自身的状态（data），等等。
+
+```js
+function mountComponent(vnode, container, anchor) {
+	const componentOptions = vnode.type
+  const { render, data } = componentOptions
+  
+  const state = reactive(data())
+  
+  // 定义组件实例，一个组件实例就是一个对象，包含组件有关的状态信息
+  const instance = {
+    // 组件自身的状态数据，即 data
+    state,
+    // 组件是否被挂载，初始值为 false
+    isMounted: false,
+    // 组件所渲染的内容，即子树（subTree）
+    subTree: null,
+  }
+  
+  // 将组件实例放在 vnode 上，用于以后更新
+  vnode.component = instance
+  
+  effect(() => {
+    // 调用组件的渲染函数，获得子树
+    const sbTree = render.call(state, state)
+    // 检查组件是否已经被挂载
+    if (!instance.isMounted) {
+      // 初次挂载
+      patch(null, subTree, container, anchor)
+      // 将组件设置为已挂载，这样以后就会进行更新，而不是挂载
+      instance.isMounted = true
+    } else {
+      // 更新组件
+      patch(instance.subTree, subTree, container. anchor)
+    }
+    // 更新组件实例的子树
+    instance.subTree = subTree
+  }, { scheduler: queueJob })
+}
+```
+
+这样，我们就可以在合适的时机调用组件的声明周期钩子：
+
+```js
+function mountComponent(vnode, container, anchor) {
+	const componentOptions = vnode.type
+  // 拿到对应的钩子
+  const { render, data, beforeCreate, created, beforeMount, mounted, beforeUpdate, updated } = componentOptions
+  
+  beforeCreate && beforeCreate()
+  const state = reactive(data())
+  
+  const instance = {
+    state,
+    isMounted: false,
+    subTree: null,
+  }
+  
+  vnode.component = instance
+  
+  // 调用时允许 this 访问组件状态
+  created && created.call(state)
+  
+  effect(() => {
+    const sbTree = render.call(state, state)
+    if (!instance.isMounted) {
+      beforeMount && beforeMount.call(state)
+      patch(null, subTree, container, anchor)
+      instance.isMounted = true
+      mounted && mounted()
+    } else {
+      beforeUpdate && beforeUpdate.call(state)
+      patch(instance.subTree, subTree, container. anchor)
+      updated && updated.call(state)
+    }
+    instance.subTree = subTree
+  }, { scheduler: queueJob })
+}
+```
+
+大概的原理就是这样。
+
+#### props 与组件的被动更新
+
+在 Vue 3 中，被子组件指定接受的 `prop`，会被传递到 `props` 中，而没指定，但是父组件传递进来的，会被传递到 `attrs` 中。我们在构建组件时，还需要考虑这两部分的数据。
+
+```js
+function mountComponent(vnode, container, anchor) {
+	const componentOptions = vnode.type
+  // 取出用户配置的 props
+  const { render, data, props: propsOption, /* 省略其他 */ } = componentOptions
+  
+  beforeCreate && beforeCreate()
+  const state = reactive(data())
+  // 解析 props 和 attrs
+  const [props, attrs] = resolveProps(propsOption, vnode.props)
+  
+  const instance = {
+    state,
+    isMounted: false,
+    subTree: null,
+  }
+  
+  vnode.component = instance
+  // ...
+}
+
+// 解析组件的 props
+function resolveProps(options, propsData) {
+  const props = []
+  const attrs = []
+  for (const key in propsData) {
+    // 遍历传入的组件属性，如果被组件定义，放入 props
+    if (key in options) {
+      props[key] = propsData[key]
+    } else {
+      // 没被组件定义，放到 attrs
+      attrs[key] = propsData[key]
+    }
+  }
+  return [props, attrs]
+}
+```
+
+具体实现上还有一些细节，比如默认值，类型校验...
+
+处理完 `props`，还要考虑当 `props` 改变时，父组件会先重新渲染，随后触发 `patchComponent` 来更新子组件，我们将这种更新叫做子组件的被动更新。当子组件被动更新时，我们需要：
+
+- 检测子组件是不是真的要更新，即 `props` 是不是真的改变了
+- 如果要更新，则更新子组件的 `props` 和 `slot` 等内容
+
+`patchComponent` 实现如下：
+
+```js
+function patchComponent(n1, n2, anchor) {
+  // 获取组件实例，即 n1.component，同时让新的组件虚拟节点 n2.component 也指向组件实例
+  const instance = (n2.component = n1.component)
+  // 获取当前的 props 数据
+  const { props } = instance
+  if (hasPropsChanged(n1.props, n2.props)) {
+    // 如果 props 改变了，拿到新的 props
+    const [nextProps] = resolveProps(n2.type.props, n2.props)
+    // 更新 props
+    for (const k in nextProps) {
+      props[k] = nextProps[k]
+    }
+    // 删除不存在的 props
+    for (const k in props) {
+      if (!(k in nextProps)) delete props[k]
+    }
+  }
+}
+
+function hasPropsChanged(prevProps, nextProps) {
+	const nextKeys = Object.keys(nextProps)
+  // 如果数量变了，说明有变化
+  if (nextKeys.length !== Object.keys(prevProps).length) {
+    return true
+  }
+  for (let i = 0; i < nextKeys.length; i++) {
+    const key = nextKeys[i]
+    // 有不相等的 props，说明有变化
+    if (nextProps[key] !== prevProps[key]) return true
+  }
+  return false
+}
+```
+
+这里的 `props` 对象是浅响应（`shallowReactive`）的，因此只需要设置 instance.props 下的属性即可触发子组件重新渲染。
+
+#### setup 的作用与实现
+
+setup 是 Vue 3 新增的组件选项，用来配合组合式 API。他可以有两种返回值：
+
+- 返回一个函数，该函数将作为该组件的 render 函数：
+
+  ```js
+  const Comp = {
+    setup() {
+  		return () => {
+        return { type: 'div', children: 'hello' }
+      }
+    }
+  }
+  ```
+
+  一般用来描述不好用模板实现的内容，比如多层嵌套的重复内容
+
+- 返回一个对象，这个对象中的数据将暴露给模板使用：
+
+  ```js
+  const Comp = {
+    setup() {
+      const count = ref(0)
+      return {
+        count,
+      }
+    },
+    render() {
+      return { type: 'div', children: `count is ${this.count}` }
+    }
+  }
+  ```
+
+  
+
+另外，setup 接受两个参数：props、context。
+
+```js
+const Comp = {
+  props: {
+    foo: String,
+  },
+  setup(props, context) {
+		props.foo // 访问 props 数据
+    // context 保存了与组件接口相关的数据和方法
+    const { slot, emit, attrs, expose } = context
+  }
+}
+```
+
+context 对象包括：
+
+- `slots`：组件接受的插槽。
+- `emit`：用来发射事件。
+- `attrs`：没被定义，但是被传入的属性。
+- `expose`：一个函数，用来显示的暴露组件数据。
+
+在 Vue 3 中，更支持使用 组合式 API。
+
+#### 组件事件与 emit 的实现
+
+在 Vue 中，我们可以使用 `emit` 函数来发射组件自定义的事件。
+
+```jsx
+const MyComponent = {
+  name: 'MyComponent',
+  setup(props, { emit }) {
+    // 发出自定义 change 事件，并传递两个参数
+		emit('change', 1, 2)
+    
+    return () => {
+			return // ...
+    }
+  },
+}
+
+// 使用
+<MyComponent @change="handler"></MyComponent>
+// 上面的模板被编译生成的 vnode 为：
+const CompVNode = {
+	type: MyComponent,
+  props: {
+		onChange: handler,
+  }
+}
+```
+
+Vue 3 将事件编译为 以 `on` 开头的属性，存储在 `props` 中。具体实现则是根据事件名称去寻找对应的事件处理函数并执行。
+
+```js
+function mountComponent(vnode, container, anchor) {
+  //...
+  const instance = {
+    state,
+    props: shallowReactive(props),
+    isMounted: false,
+    subTree: null,
+  }
+  // 定义 emit 函数
+  function emit(event, ...payload) {
+    // 将事件转换为 on 开头 change -> onChange
+		const eventName = `on${event[0].toUpperCase() + event.slice(1)}`
+    // 去寻找事件处理函数
+    const handler = instance.props[eventName]
+    if (handler) {
+      handler(...payload)
+    } else {
+			console.log('事件不存在')
+    }
+  }
+  // 将 emit 函数添加到 context 中，提供给 setup
+  const setupContext = { attrs, emit }
+  // ...
+}
+```
+
+但是现在由于事件没有在 props 中声明过，会被 `resolveProps` 放入 `attrs` 中，导致我们找不到事件属性，所以我们还需要接着优化一下：
+
+```js
+function resolveProps(options, propsData) {
+  const props = {}
+  const attrs = {}
+  for (const key of propsData) {
+    // 以字符串 on 开头的 props，无论是否显示地声明，都将它添加到 props
+    if (key in options || key.startsWith('on')) {
+      props[key] = propsData[key]
+    } else {
+      attrs[key] = propsData[key]
+    }
+  }
+  return [props, attrs]
+}
+```
+
+#### 插槽的工作原理与实现
+
+插槽 是组件预留的一个槽位，具体渲染的内容由调用者传入。
+
+```vue
+<template>
+	<header><slot name="header" /></header>
+	<div><slot name="body" /></div>
+	<footer><slot name="footer" /></footer>
+</template>
+```
+
+父组件可以传入对应的内容：
+
+```vue
+<template>
+	<MyComponent>
+  	<template #header>
+			<h1>我是标题</h1>
+		</template>
+		<template #body>
+			<section>我是内容</section>
+		</template>
+		<template #footer>
+			<p>我是注脚</p>
+		</template>
+  </MyComponent>
+</template>
+```
+
+这段父组件模板会被编译成如下的渲染函数：
+
+```js
+function render() {
+  return {
+    type: MyComponent,
+    // 组件的 children 会被编译成一个对象
+    children: {
+			header() {
+				return { type: 'h1', children: '我是标题' }
+      },
+      body() {
+        return { type: 'section', children: '我是内容' }
+      },
+      footer() {
+				return { type: 'p', children: '我是注脚' }
+      }
+    }
+  }
+}
+```
+
+而有插槽的子组件则会被编译为：
+
+```js
+// MyComponent 组件的编译结果
+function render() {
+  // 没有根元素，返回的是一个数组
+  return [
+    {
+      type: 'header',
+      children: [this.$slot.header()]
+    },
+    {
+      type: 'body',
+      children: [this.$slot.body()]
+    },
+    {
+      type: 'footer',
+      children: [this.$slot.footer()]
+    }
+  ]
+}
+```
+
+我们可以发现，插槽的工作原理和 `render` 函数十分类似，就是调用插槽函数获得渲染内容。在运行时的实现上，插槽则依赖于 `setupContext` 中的 `slots` 对象，如下代码所示：
+
+```js
+function mountComponent(vnode, container, anchor) {
+  // 省略部分代码
+  
+  // 直接使用编译好的 vnode.children 对象作为 slots 对象即可
+  const slots = vnode.children || {}
+  
+  const setupContext = { attrs, emit, slots }
+}
+```
+
+最简单的 `slot` 实现非常简单，就是将编译器编译好的 `children` 属性作为 `slot` 的值。
+
+#### 注册生命周期
+
+在 Vue 中，我们还可以自己注册生命周期钩子。
+
+```js
+import { onMounted } from 'vue'
+
+const MyComponent = {
+  setup() {
+    onMounted(() => {
+      console.log('mounted 1')
+    })
+    // 可以注册多个
+    onMounted(() => {
+      console.log('mounted 2')
+    })
+    // ...
+  }
+}
+```
+
+为了能让 `onMounted` 函数能够注册到对应组件上，我们需要维护一个全局变量 `currentInstance`，来保存当前的组件实例。每当初始化组件时，我们先将它设置为当前组价实例，再执行 `setup` 函数，这样我们就可以通过 `currentInstance` 来获取当前正在初始化的组件实例。
+
+```js
+let currentInstance = null
+
+function setCurrentInstance(instance) {
+	currentInstance = instance
+}
+
+function mountComponent(vnode, container, anchor) {
+  // ...
+  
+  const instance = {
+    state,
+    props: shallowReactive(props),
+    isMounted: false,
+    subTree: null,
+    slots,
+    // 在组件实例中添加 mounted 数组，用来储存 onMounted 函数注册的生命周期钩子函数
+    mounted: []
+  }
+  
+  // ...
+  
+  const setupContext = { attrs, emit, slots }
+  
+  // 执行 setup 之前，设置当前组件实例
+  setCurrentInstance(instance)
+  // 执行 setup
+  const setupResult = setup(shallowReadonly(instance.props), setupContext)
+  // 重置当前组件实例
+  setCurrentInstance(null)
+}
+```
+
+以 mounted 钩子为例，我们只需要在注册时，将函数推入数组中，就可以实现多次注册了。
+
+```js
+function onMounted(fn) {
+  if (currentInstance) {
+    currentInstance.mounted.push(fn)
+  } else {
+    console.log('onMounted 函数只能在 setup 中调用')
+  }
+}
+```
+
+最后，我们需要在合适的时机来调用这些钩子：
+
+```js
+function mountComponent(vnode, container, anchor) {
+  // ...
+  effect(() => {
+    const subTree = render.call(render(renderContext, renderContext))
+    if (!instance.isMounted) {
+      // ...
+      
+      // 遍历执行钩子函数
+      instance.mounted && instance.mounted.forEach(hook => hook.call(renderContext))
+    } else {
+      // ...
+    }
+    instance.subTree = subTree
+  }, {
+    sheduler: queueJob
+  })
+}
+```
+
+其他钩子函数原理是一样的。
